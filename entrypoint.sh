@@ -1,17 +1,28 @@
 #!/bin/bash
 set -e
 
-echo "Starting ComfyUI..."
-python /ComfyUI/main.py --listen --use-sage-attention &
+echo "====================================="
+echo " Starting ComfyUI..."
+echo "====================================="
 
-echo "Waiting for ComfyUI to accept connections..."
-for i in {1..120}; do
-  if curl -s http://127.0.0.1:8188/ >/dev/null 2>&1; then
-    echo "ComfyUI is responding."
+python3 /ComfyUI/main.py --listen 0.0.0.0 --port 8188 &
+
+COMFY_PID=$!
+
+echo "Waiting for ComfyUI to be ready..."
+
+for i in {1..60}; do
+  if curl -s http://127.0.0.1:8188/ > /dev/null; then
+    echo "ComfyUI is ready."
     break
   fi
-  sleep 2
+  sleep 1
 done
 
-echo "Launching RunPod handler..."
-exec python /app/handler.py
+echo "====================================="
+echo " Starting RunPod Handler..."
+echo "====================================="
+
+python3 /app/handler.py
+
+wait $COMFY_PID
