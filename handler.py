@@ -62,9 +62,10 @@ def get_history(prompt_id):
 
 def get_videos(ws, prompt, client_id):
     prompt_id = queue_prompt(prompt, client_id)["prompt_id"]
+    logger.info(f"🟢 Prompt queued: {prompt_id}")
 
     start_time = time.time()
-    MAX_WAIT = 180
+    MAX_WAIT = 300  # 5 minutes for heavy Wan jobs
 
     while True:
         if time.time() - start_time > MAX_WAIT:
@@ -81,6 +82,7 @@ def get_videos(ws, prompt, client_id):
             if msg.get("type") == "executing":
                 data = msg.get("data", {})
                 if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                    logger.info("🟢 ComfyUI execution finished")
                     break
 
     history = get_history(prompt_id).get(prompt_id, {})
@@ -94,7 +96,7 @@ def get_videos(ws, prompt, client_id):
                     videos.append(base64.b64encode(f.read()).decode())
 
     if not videos:
-        logger.error(f"No video generated. History: {json.dumps(history, indent=2)}")
+        logger.error(f"❌ No video generated. History: {json.dumps(history, indent=2)}")
 
     return videos
 
@@ -109,14 +111,17 @@ def load_workflow(filename):
 
 def wait_for_comfyui():
     start = time.time()
-    READY_TIMEOUT = 60
+    READY_TIMEOUT = 180  # 3 minutes
+
+    logger.info("⏳ Waiting for ComfyUI to become ready...")
 
     while True:
         if time.time() - start > READY_TIMEOUT:
-            raise RuntimeError("ComfyUI failed to start within 60 seconds")
+            raise RuntimeError("❌ ComfyUI failed to start within 180 seconds")
 
         try:
             urllib.request.urlopen(f"http://{server_address}:8188/", timeout=2)
+            logger.info("✅ ComfyUI is ready.")
             return
         except:
             time.sleep(1)
@@ -128,6 +133,7 @@ def handler(job):
 
     try:
         job_input = job.get("input", {})
+        logger.info(f"🟡 New job received: {job_input.keys()}")
 
         # Image input
         if "image_path" in job_input:
@@ -190,6 +196,7 @@ def handler(job):
         ws.close()
 
         if videos:
+            logger.info("🎉 Video generated successfully")
             return {"video": videos[0]}
 
         return {"error": "No video generated"}
