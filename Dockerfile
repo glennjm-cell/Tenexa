@@ -8,6 +8,14 @@ FROM wlsdml1114/multitalk-base:1.7 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
+# System deps
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Python deps
 RUN pip install -U pip && \
     pip install runpod websocket-client "huggingface_hub[hf_transfer]"
@@ -42,7 +50,7 @@ RUN cd /ComfyUI/custom_nodes && \
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/orssorbit/ComfyUI-wanBlockswap.git
 
-# Download models and LoRA
+# Models
 RUN mkdir -p /ComfyUI/models/{diffusion_models,vae,text_encoders,loras,clip_vision} && \
     wget -q https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors \
       -O /ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors && \
@@ -62,8 +70,11 @@ COPY . /app
 COPY extra_model_paths.yaml /ComfyUI/extra_model_paths.yaml
 RUN chmod +x /app/entrypoint.sh
 
+# Clean caches (important for serverless cold start)
+RUN rm -rf /root/.cache/pip && rm -rf /tmp/*
+
 ########################################
-# STAGE 2 — CLEAN RUNTIME
+# STAGE 2 — RUNTIME
 ########################################
 FROM wlsdml1114/multitalk-base:1.7
 
