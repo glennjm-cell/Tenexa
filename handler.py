@@ -65,7 +65,7 @@ def get_videos(ws, prompt, client_id):
     logger.info(f"🟢 Prompt queued: {prompt_id}")
 
     start_time = time.time()
-    MAX_WAIT = 300  # 5 minutes for heavy Wan jobs
+    MAX_WAIT = 300
 
     while True:
         if time.time() - start_time > MAX_WAIT:
@@ -111,7 +111,7 @@ def load_workflow(filename):
 
 def wait_for_comfyui():
     start = time.time()
-    READY_TIMEOUT = 180  # 3 minutes
+    READY_TIMEOUT = 180
 
     logger.info("⏳ Waiting for ComfyUI to become ready...")
 
@@ -135,13 +135,15 @@ def handler(job):
         job_input = job.get("input", {})
         logger.info(f"🟡 New job received: {job_input.keys()}")
 
-        # Image input
-        if "image_path" in job_input:
-            image_path = process_input(job_input["image_path"], task_dir, "image.png", "path")
+        # =========================
+        # IMAGE INPUT (FIXED ORDER)
+        # =========================
+        if "image_base64" in job_input:
+            image_path = process_input(job_input["image_base64"], task_dir, "image.png", "base64")
         elif "image_url" in job_input:
             image_path = process_input(job_input["image_url"], task_dir, "image.png", "url")
-        elif "image_base64" in job_input:
-            image_path = process_input(job_input["image_base64"], task_dir, "image.png", "base64")
+        elif "image_path" in job_input:
+            image_path = process_input(job_input["image_path"], task_dir, "image.png", "path")
         else:
             image_path = os.path.join(BASE_DIR, "example_image.png")
 
