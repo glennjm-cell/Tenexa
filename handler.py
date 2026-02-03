@@ -8,6 +8,7 @@ import logging
 import urllib.request
 import time
 import shutil
+from typing import Any, Dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,12 +102,30 @@ def get_videos(ws, prompt, client_id):
     return videos
 
 
-def load_workflow(filename):
+def load_workflow(filename: str) -> Dict[str, Any]:
+    """
+    Robust workflow loader:
+    - Clear error if missing
+    - Clear error if empty
+    - Clear error if invalid JSON (with preview)
+    """
     path = os.path.join(BASE_DIR, filename)
+
     if not os.path.exists(path):
         raise FileNotFoundError(f"Workflow file not found: {path}")
+
+    # Read raw first so we can detect empty or invalid content clearly
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        raw = f.read()
+
+    if not raw.strip():
+        raise ValueError(f"Workflow file is empty (0 bytes / blank): {path}")
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        preview = raw[:200].replace("\n", "\\n")
+        raise ValueError(f"Workflow JSON invalid: {path} | {e} | preview='{preview}'")
 
 
 def wait_for_comfyui():
@@ -132,8 +151,22 @@ def handler(job):
     task_dir = f"/tmp/task_{uuid.uuid4()}"
 
     try:
-        job_input = job.get("input", {})
-        logger.info(f"🟡 New job received: {job_input.keys()}")
+        job_input = job.get("input", {}) or {}
+        logger.info(f"🟡 New job received keys: {list(job_input.keys())}")
+
+        # =========================
+        # WARMUP / TEST SHORT-CIRCUIT
+        # =========================
+        # Your earlier test payload was {"input":{"test":true}}
+        # This prevents it from crashing by trying to load workflows.
+        if job_input.get("warmup") is True or job_input.get("test") is True:
+            # Still waits for ComfyUI so you can use this as a warmup trigger
+            wait_for_comfyui()
+            return {
+                "ok": True,
+                "message": "Warmup/test acknowledged. ComfyUI ready.",
+                "server_address": server_address
+            }
 
         # =========================
         # IMAGE INPUT (FIXED ORDER)
@@ -157,13 +190,17 @@ def handler(job):
             end_image_path = process_input(job_input["end_image_base64"], task_dir, "end.png", "base64")
 
         workflow_file = "new_Wan22_flf2v_api.json" if end_image_path else "new_Wan22_api.json"
+        workflow_path = os.path.join(BASE_DIR, workflow_file)
+        logger.info(f"📄 Using workflow: {workflow_path}")
+
         prompt = load_workflow(workflow_file)
 
-        seed = job_input.get("seed", int(time.time()))
-        cfg = job_input.get("cfg", 2.0)
-        length = job_input.get("length", 81)
-        steps = job_input.get("steps", 10)
+        seed = int(job_input.get("seed", int(time.time())))
+        cfg = float(job_input.get("cfg", 2.0))
+        length = int(job_input.get("length", 81))
+        steps = int(job_input.get("steps", 10))
 
+        # ---- Apply inputs to workflow (your existing node IDs) ----
         prompt["244"]["inputs"]["image"] = image_path
         prompt["541"]["inputs"]["num_frames"] = length
         prompt["135"]["inputs"]["positive_prompt"] = job_input.get("prompt", "")
@@ -180,7 +217,7 @@ def handler(job):
         prompt["236"]["inputs"]["value"] = to_nearest_multiple_of_16(job_input.get("height", 832))
 
         prompt["498"]["inputs"]["context_frames"] = length
-        prompt["498"]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
+        prompt["498"]["inputs"]["context_overlap"] = int(job_input.get("context_overlap", 48))
 
         if "834" in prompt:
             prompt["834"]["inputs"]["steps"] = steps
@@ -199,9 +236,20 @@ def handler(job):
 
         if videos:
             logger.info("🎉 Video generated successfully")
-            return {"video": videos[0]}
+
+            # Return a stable key name for your web app
+            # (your PHP/JS can look for output.video_base64)
+            return {
+                "video_base64": videos[0],
+                "video": videos[0]  # optional backwards-compat
+            }
 
         return {"error": "No video generated"}
+
+    except Exception as e:
+        # Surface errors clearly in RunPod /status output
+        logger.exception("❌ Handler error")
+        return {"error": str(e)}
 
     finally:
         if os.path.exists(task_dir):
