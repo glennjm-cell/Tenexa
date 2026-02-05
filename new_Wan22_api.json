@@ -1,211 +1,542 @@
-import runpod
-import os
-import websocket
-import base64
-import json
-import uuid
-import logging
-import urllib.request
-import time
-import shutil
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def to_nearest_multiple_of_16(value):
-    numeric_value = float(value)
-    adjusted = int(round(numeric_value / 16.0) * 16)
-    return max(adjusted, 16)
-
-
-def download_with_timeout(url, path, timeout=30):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        with open(path, "wb") as f:
-            f.write(r.read())
-    return path
-
-
-def save_base64_to_file(base64_data, temp_dir, filename):
-    os.makedirs(temp_dir, exist_ok=True)
-    path = os.path.join(temp_dir, filename)
-    with open(path, "wb") as f:
-        f.write(base64.b64decode(base64_data))
-    return path
-
-
-def process_input(input_data, temp_dir, filename, input_type):
-    if input_type == "path":
-        return input_data
-    if input_type == "url":
-        return download_with_timeout(input_data, os.path.join(temp_dir, filename))
-    if input_type == "base64":
-        return save_base64_to_file(input_data, temp_dir, filename)
-    raise Exception("Unsupported input type")
-
-
-def queue_prompt(prompt, client_id):
-    url = f"http://{server_address}:8188/prompt"
-    payload = {"prompt": prompt, "client_id": client_id}
-    req = urllib.request.Request(url, json.dumps(payload).encode("utf-8"))
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get_history(prompt_id):
-    url = f"http://{server_address}:8188/history/{prompt_id}"
-    return json.loads(urllib.request.urlopen(url, timeout=10).read())
-
-
-def get_videos(ws, prompt, client_id):
-    prompt_id = queue_prompt(prompt, client_id)["prompt_id"]
-    logger.info(f"🟢 Prompt queued: {prompt_id}")
-
-    start_time = time.time()
-    MAX_WAIT = 300
-
-    while True:
-        if time.time() - start_time > MAX_WAIT:
-            raise TimeoutError("ComfyUI execution timed out")
-
-        try:
-            ws.settimeout(5)
-            msg = ws.recv()
-        except websocket.WebSocketTimeoutException:
-            continue
-
-        if isinstance(msg, str):
-            msg = json.loads(msg)
-            if msg.get("type") == "executing":
-                data = msg.get("data", {})
-                if data.get("node") is None and data.get("prompt_id") == prompt_id:
-                    logger.info("🟢 ComfyUI execution finished")
-                    break
-
-    history = get_history(prompt_id).get(prompt_id, {})
-    outputs = history.get("outputs", {})
-
-    videos = []
-    for node in outputs.values():
-        if "gifs" in node:
-            for video in node["gifs"]:
-                with open(video["fullpath"], "rb") as f:
-                    videos.append(base64.b64encode(f.read()).decode())
-
-    if not videos:
-        logger.error(f"❌ No video generated. History: {json.dumps(history, indent=2)}")
-
-    return videos
-
-
-def load_workflow(filename):
-    path = os.path.join(BASE_DIR, filename)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Workflow file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def wait_for_comfyui():
-    start = time.time()
-    READY_TIMEOUT = 180
-
-    logger.info("⏳ Waiting for ComfyUI to become ready...")
-
-    while True:
-        if time.time() - start > READY_TIMEOUT:
-            raise RuntimeError("❌ ComfyUI failed to start within 180 seconds")
-
-        try:
-            urllib.request.urlopen(f"http://{server_address}:8188/", timeout=2)
-            logger.info("✅ ComfyUI is ready.")
-            return
-        except:
-            time.sleep(1)
-
-
-def handler(job):
-    client_id = str(uuid.uuid4())
-    task_dir = f"/tmp/task_{uuid.uuid4()}"
-
-    try:
-        job_input = job.get("input", {})
-        logger.info(f"🟡 New job received: {job_input.keys()}")
-
-        # =========================
-        # IMAGE INPUT (FIXED ORDER)
-        # =========================
-        if "image_base64" in job_input:
-            image_path = process_input(job_input["image_base64"], task_dir, "image.png", "base64")
-        elif "image_url" in job_input:
-            image_path = process_input(job_input["image_url"], task_dir, "image.png", "url")
-        elif "image_path" in job_input:
-            image_path = process_input(job_input["image_path"], task_dir, "image.png", "path")
-        else:
-            image_path = os.path.join(BASE_DIR, "example_image.png")
-
-        # Optional end image
-        end_image_path = None
-        if "end_image_path" in job_input:
-            end_image_path = process_input(job_input["end_image_path"], task_dir, "end.png", "path")
-        elif "end_image_url" in job_input:
-            end_image_path = process_input(job_input["end_image_url"], task_dir, "end.png", "url")
-        elif "end_image_base64" in job_input:
-            end_image_path = process_input(job_input["end_image_base64"], task_dir, "end.png", "base64")
-
-        workflow_file = "new_Wan22_flf2v_api.json" if end_image_path else "new_Wan22_api.json"
-        prompt = load_workflow(workflow_file)
-
-        seed = job_input.get("seed", int(time.time()))
-        cfg = job_input.get("cfg", 2.0)
-        length = job_input.get("length", 81)
-        steps = job_input.get("steps", 10)
-
-        prompt["244"]["inputs"]["image"] = image_path
-        prompt["541"]["inputs"]["num_frames"] = length
-        prompt["135"]["inputs"]["positive_prompt"] = job_input.get("prompt", "")
-        prompt["135"]["inputs"]["negative_prompt"] = job_input.get(
-            "negative_prompt",
-            "bright tones, overexposed, static, blurred details"
-        )
-
-        prompt["220"]["inputs"]["seed"] = seed
-        prompt["540"]["inputs"]["seed"] = seed
-        prompt["540"]["inputs"]["cfg"] = cfg
-
-        prompt["235"]["inputs"]["value"] = to_nearest_multiple_of_16(job_input.get("width", 480))
-        prompt["236"]["inputs"]["value"] = to_nearest_multiple_of_16(job_input.get("height", 832))
-
-        prompt["498"]["inputs"]["context_frames"] = length
-        prompt["498"]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
-
-        if "834" in prompt:
-            prompt["834"]["inputs"]["steps"] = steps
-            prompt["829"]["inputs"]["step"] = int(steps * 0.6)
-
-        if end_image_path:
-            prompt["617"]["inputs"]["image"] = end_image_path
-
-        wait_for_comfyui()
-
-        ws = websocket.WebSocket()
-        ws.connect(f"ws://{server_address}:8188/ws?clientId={client_id}")
-
-        videos = get_videos(ws, prompt, client_id)
-        ws.close()
-
-        if videos:
-            logger.info("🎉 Video generated successfully")
-            return {"video": videos[0]}
-
-        return {"error": "No video generated"}
-
-    finally:
-        if os.path.exists(task_dir):
-            shutil.rmtree(task_dir, ignore_errors=True)
-
-
-runpod.serverless.start({"handler": handler})
+{
+  "122": {
+    "inputs": {
+      "model": "Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors",
+      "base_precision": "bf16",
+      "quantization": "fp8_e4m3fn",
+      "load_device": "offload_device",
+      "attention_mode": "sageattn",
+      "rms_norm_function": "default"
+    },
+    "class_type": "WanVideoModelLoader",
+    "_meta": {
+      "title": "WanVideo Model Loader"
+    }
+  },
+  "129": {
+    "inputs": {
+      "model_name": "Wan2_1_VAE_bf16.safetensors",
+      "precision": "bf16"
+    },
+    "class_type": "WanVideoVAELoader",
+    "_meta": {
+      "title": "WanVideo VAE Loader"
+    }
+  },
+  "130": {
+    "inputs": {
+      "enable_vae_tiling": false,
+      "tile_x": 272,
+      "tile_y": 272,
+      "tile_stride_x": 144,
+      "tile_stride_y": 128,
+      "normalization": "default",
+      "vae": [
+        "129",
+        0
+      ],
+      "samples": [
+        "540",
+        0
+      ]
+    },
+    "class_type": "WanVideoDecode",
+    "_meta": {
+      "title": "WanVideo Decode"
+    }
+  },
+  "131": {
+    "inputs": {
+      "frame_rate": 16,
+      "loop_count": 0,
+      "filename_prefix": "WanVideo_X264",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": true,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "612",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62"
+    }
+  },
+  "135": {
+    "inputs": {
+      "positive_prompt": "She locks eyes with the camera, slowly sticks out her tongue, and holds the pose completely still.",
+      "negative_prompt": "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+      "force_offload": true,
+      "use_disk_cache": false,
+      "device": "gpu",
+      "t5": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "WanVideoTextEncode",
+    "_meta": {
+      "title": "WanVideo TextEncode"
+    }
+  },
+  "136": {
+    "inputs": {
+      "model_name": "umt5-xxl-enc-bf16.safetensors",
+      "precision": "bf16",
+      "load_device": "offload_device",
+      "quantization": "disabled"
+    },
+    "class_type": "LoadWanVideoT5TextEncoder",
+    "_meta": {
+      "title": "WanVideo T5 Text Encoder Loader"
+    }
+  },
+  "171": {
+    "inputs": {
+      "width": [
+        "235",
+        0
+      ],
+      "height": [
+        "236",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "keep_proportion": "crop",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 2,
+      "device": "cpu",
+      "per_batch": 0,
+      "image": [
+        "244",
+        0
+      ]
+    },
+    "class_type": "ImageResizeKJv2",
+    "_meta": {
+      "title": "Resize Image v2"
+    }
+  },
+  "173": {
+    "inputs": {
+      "clip_name": "clip_vision_h.safetensors"
+    },
+    "class_type": "CLIPVisionLoader",
+    "_meta": {
+      "title": "CLIP_VISION \ub85c\ub4dc"
+    }
+  },
+  "193": {
+    "inputs": {
+      "strength_1": 1.0000000000000002,
+      "strength_2": 1,
+      "crop": "center",
+      "combine_embeds": "average",
+      "force_offload": true,
+      "tiles": 0,
+      "ratio": 0.5000000000000001,
+      "clip_vision": [
+        "173",
+        0
+      ],
+      "image_1": [
+        "171",
+        0
+      ],
+      "image_2": [
+        "613",
+        0
+      ]
+    },
+    "class_type": "WanVideoClipVisionEncode",
+    "_meta": {
+      "title": "WanVideo ClipVision Encode"
+    }
+  },
+  "220": {
+    "inputs": {
+      "steps": [
+        "569",
+        0
+      ],
+      "cfg": [
+        "570",
+        0
+      ],
+      "shift": 9.000000000000002,
+      "seed": 699304766202890,
+      "force_offload": true,
+      "scheduler": "dpm++_sde",
+      "riflex_freq_index": 0,
+      "denoise_strength": 1,
+      "batched_cfg": false,
+      "rope_function": "comfy",
+      "start_step": 0,
+      "end_step": [
+        "575",
+        0
+      ],
+      "add_noise_to_samples": true,
+      "model": [
+        "556",
+        0
+      ],
+      "image_embeds": [
+        "541",
+        0
+      ],
+      "text_embeds": [
+        "135",
+        0
+      ],
+      "context_options": [
+        "498",
+        0
+      ]
+    },
+    "class_type": "WanVideoSampler",
+    "_meta": {
+      "title": "WanVideo Sampler"
+    }
+  },
+  "235": {
+    "inputs": {
+      "value": 528
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "INT Constant"
+    }
+  },
+  "236": {
+    "inputs": {
+      "value": 720
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "INT Constant"
+    }
+  },
+  "244": {
+    "inputs": {
+      "image": "videoframe_0.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "\uc774\ubbf8\uc9c0 \ub85c\ub4dc"
+    }
+  },
+  "279": {
+    "inputs": {
+      "lora_0": "high_noise_model.safetensors",
+      "strength_0": 1,
+      "lora_1": "none",
+      "strength_1": 1,
+      "lora_2": "none",
+      "strength_2": 0.8,
+      "lora_3": "none",
+      "strength_3": 1.0000000000000002,
+      "lora_4": "none",
+      "strength_4": 1.0000000000000002,
+      "low_mem_load": false,
+      "merge_loras": false
+    },
+    "class_type": "WanVideoLoraSelectMulti",
+    "_meta": {
+      "title": "WanVideo Lora Select Multi"
+    }
+  },
+  "498": {
+    "inputs": {
+      "context_schedule": "static_standard",
+      "context_frames": 81,
+      "context_stride": 4,
+      "context_overlap": 48,
+      "freenoise": true,
+      "verbose": false,
+      "fuse_method": "linear"
+    },
+    "class_type": "WanVideoContextOptions",
+    "_meta": {
+      "title": "WanVideo Context Options"
+    }
+  },
+  "525": {
+    "inputs": {
+      "blocks_to_swap": 0,
+      "enable_cuda_optimization": true,
+      "enable_dram_optimization": true,
+      "auto_hardware_tuning": false,
+      "vram_threshold_percent": 90,
+      "num_cuda_streams": 6,
+      "bandwidth_target": 0.8,
+      "offload_txt_emb": false,
+      "offload_img_emb": false,
+      "vace_blocks_to_swap": 0,
+      "debug_mode": false
+    },
+    "class_type": "WanVideoEnhancedBlockSwap",
+    "_meta": {
+      "title": "WanVideo Enhanced BlockSwap"
+    }
+  },
+  "540": {
+    "inputs": {
+      "steps": [
+        "569",
+        0
+      ],
+      "cfg": 1.0000000000000002,
+      "shift": 9.000000000000002,
+      "seed": 761324475440176,
+      "force_offload": true,
+      "scheduler": "dpm++_sde",
+      "riflex_freq_index": 0,
+      "denoise_strength": 1,
+      "batched_cfg": false,
+      "rope_function": "comfy",
+      "start_step": [
+        "575",
+        0
+      ],
+      "end_step": -1,
+      "add_noise_to_samples": false,
+      "model": [
+        "552",
+        0
+      ],
+      "image_embeds": [
+        "541",
+        0
+      ],
+      "text_embeds": [
+        "135",
+        0
+      ],
+      "samples": [
+        "220",
+        0
+      ],
+      "context_options": [
+        "498",
+        0
+      ]
+    },
+    "class_type": "WanVideoSampler",
+    "_meta": {
+      "title": "WanVideo Sampler"
+    }
+  },
+  "541": {
+    "inputs": {
+      "width": [
+        "235",
+        0
+      ],
+      "height": [
+        "236",
+        0
+      ],
+      "num_frames": 161,
+      "noise_aug_strength": 0,
+      "start_latent_strength": 1,
+      "end_latent_strength": 1,
+      "force_offload": true,
+      "fun_or_fl2v_model": false,
+      "tiled_vae": false,
+      "vae": [
+        "129",
+        0
+      ],
+      "clip_embeds": [
+        "193",
+        0
+      ],
+      "start_image": [
+        "171",
+        0
+      ],
+      "end_image": null
+    },
+    "class_type": "WanVideoImageToVideoEncode",
+    "_meta": {
+      "title": "WanVideo ImageToVideo Encode"
+    }
+  },
+  "549": {
+    "inputs": {
+      "model": "Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors",
+      "base_precision": "bf16",
+      "quantization": "fp8_e4m3fn",
+      "load_device": "offload_device",
+      "attention_mode": "sageattn",
+      "rms_norm_function": "default",
+      "block_swap_args": [
+        "525",
+        0
+      ]
+    },
+    "class_type": "WanVideoModelLoader",
+    "_meta": {
+      "title": "WanVideo Model Loader"
+    }
+  },
+  "552": {
+    "inputs": {
+      "model": [
+        "549",
+        0
+      ],
+      "lora": [
+        "553",
+        0
+      ]
+    },
+    "class_type": "WanVideoSetLoRAs",
+    "_meta": {
+      "title": "WanVideo Set LoRAs"
+    }
+  },
+  "553": {
+    "inputs": {
+      "lora_0": "low_noise_model.safetensors",
+      "strength_0": 1,
+      "lora_1": "none",
+      "strength_1": 1,
+      "lora_2": "none",
+      "strength_2": 0.8,
+      "lora_3": "none",
+      "strength_3": 1,
+      "lora_4": "none",
+      "strength_4": 1,
+      "low_mem_load": false,
+      "merge_loras": false
+    },
+    "class_type": "WanVideoLoraSelectMulti",
+    "_meta": {
+      "title": "WanVideo Lora Select Multi"
+    }
+  },
+  "555": {
+    "inputs": {
+      "model": [
+        "122",
+        0
+      ],
+      "block_swap_args": [
+        "525",
+        0
+      ]
+    },
+    "class_type": "WanVideoSetBlockSwap",
+    "_meta": {
+      "title": "WanVideo Set BlockSwap"
+    }
+  },
+  "556": {
+    "inputs": {
+      "model": [
+        "555",
+        0
+      ],
+      "lora": [
+        "279",
+        0
+      ]
+    },
+    "class_type": "WanVideoSetLoRAs",
+    "_meta": {
+      "title": "WanVideo Set LoRAs"
+    }
+  },
+  "569": {
+    "inputs": {
+      "value": 8
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "INT Constant"
+    }
+  },
+  "570": {
+    "inputs": {
+      "steps": [
+        "569",
+        0
+      ],
+      "cfg_scale_start": 2,
+      "cfg_scale_end": 2,
+      "interpolation": "linear",
+      "start_percent": 0,
+      "end_percent": 0.01
+    },
+    "class_type": "CreateCFGScheduleFloatList",
+    "_meta": {
+      "title": "Create CFG Schedule Float List"
+    }
+  },
+  "575": {
+    "inputs": {
+      "value": 4
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "INT Constant"
+    }
+  },
+  "612": {
+    "inputs": {
+      "enable_vae_tiling": false,
+      "tile_x": 272,
+      "tile_y": 272,
+      "tile_stride_x": 144,
+      "tile_stride_y": 128,
+      "normalization": "default",
+      "vae": [
+        "129",
+        0
+      ],
+      "samples": [
+        "540",
+        0
+      ]
+    },
+    "class_type": "WanVideoDecode",
+    "_meta": {
+      "title": "WanVideo Decode"
+    }
+  },
+  "613": {
+    "inputs": {
+      "width": [
+        "235",
+        0
+      ],
+      "height": [
+        "236",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "keep_proportion": "crop",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 2,
+      "device": "cpu",
+      "per_batch": 0,
+      "image": [
+        "617",
+        0
+      ]
+    },
+    "class_type": "ImageResizeKJv2",
+    "_meta": {
+      "title": "Resize Image v2"
+    }
+  }
+}
