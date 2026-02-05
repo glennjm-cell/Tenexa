@@ -14,7 +14,118 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ComfyUI server inside the container
-server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1")
+server_address = os.getenv("
+# ---------- Tenexa helpers ----------
+COMFY_ROOT = os.environ.get("COMFY_ROOT", "/ComfyUI")
+COMFY_INPUT_DIR = os.path.join(COMFY_ROOT, "input")
+COMFY_OUTPUT_DIR = os.path.join(COMFY_ROOT, "output")
+
+def _ensure_dirs():
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    os.makedirs(COMFY_OUTPUT_DIR, exist_ok=True)
+
+def _safe_filename(name: str, default: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
+    return name if name else default
+
+def save_image_to_comfy_input(image_data, filename_hint: str) -> str:
+    """
+    Save an input image (base64 or URL) into ComfyUI's input folder.
+    Returns the *filename* to pass to ComfyUI LoadImage nodes (not a full path).
+    """
+    _ensure_dirs()
+    fname = _safe_filename(filename_hint, f"input_{uuid.uuid4().hex}.png")
+    if not (fname.lower().endswith(".png") or fname.lower().endswith(".jpg") or fname.lower().endswith(".jpeg") or fname.lower().endswith(".webp")):
+        fname += ".png"
+    out_path = os.path.join(COMFY_INPUT_DIR, fname)
+
+    if isinstance(image_data, str) and image_data.startswith("http"):
+        # Download URL -> input dir
+        resp = requests.get(image_data, timeout=60)
+        resp.raise_for_status()
+        with open(out_path, "wb") as f:
+            f.write(resp.content)
+        return fname
+
+    # base64 (optionally with data: prefix)
+    if isinstance(image_data, str) and image_data.startswith("data:image"):
+        image_data = image_data.split(",", 1)[1]
+
+    if isinstance(image_data, str):
+        raw = base64.b64decode(image_data)
+        with open(out_path, "wb") as f:
+            f.write(raw)
+        return fname
+
+    raise ValueError("Unsupported image input. Provide base64 string or http(s) URL.")
+
+def resolve_comfy_output_item(item: dict) -> str | None:
+    """
+    Convert a ComfyUI history output item to an absolute file path.
+    Item format often includes: filename, subfolder, type
+    """
+    if not isinstance(item, dict):
+        return None
+    filename = item.get("filename")
+    if not filename:
+        return None
+    subfolder = item.get("subfolder") or ""
+    # output files are under COMFY_OUTPUT_DIR
+    return os.path.join(COMFY_OUTPUT_DIR, subfolder, filename)
+
+def get_any_outputs(history: dict, prefer_node: str | None = None) -> list[str]:
+    """
+    Extract file paths from ComfyUI /history result. Handles gifs/videos/images keys.
+    """
+    outs = []
+    outputs = (history or {}).get("outputs", {})
+    # Optionally only from a specific node
+    node_items = outputs.get(str(prefer_node)) if prefer_node is not None else None
+    nodes_to_scan = {str(prefer_node): node_items} if node_items else outputs
+
+    for node_id, node_out in (nodes_to_scan or {}).items():
+        if not isinstance(node_out, dict):
+            continue
+        for key in ("videos", "gifs", "images"):
+            if key in node_out and isinstance(node_out[key], list):
+                for item in node_out[key]:
+                    path = resolve_comfy_output_item(item)
+                    if path and os.path.exists(path):
+                        outs.append(path)
+        # some custom nodes store "files"
+        if "files" in node_out and isinstance(node_out["files"], list):
+            for item in node_out["files"]:
+                path = resolve_comfy_output_item(item)
+                if path and os.path.exists(path):
+                    outs.append(path)
+
+    # de-dup, keep order
+    seen=set()
+    uniq=[]
+    for p in outs:
+        if p not in seen:
+            uniq.append(p); seen.add(p)
+    return uniq
+
+def diagnostics() -> dict:
+    import shutil as _sh
+    _ensure_dirs()
+    total, used, free = _sh.disk_usage(COMFY_ROOT)
+    return {
+        "comfy_root": COMFY_ROOT,
+        "comfy_input_dir": COMFY_INPUT_DIR,
+        "comfy_output_dir": COMFY_OUTPUT_DIR,
+        "disk_gb": {"total": round(total/1e9,2), "used": round(used/1e9,2), "free": round(free/1e9,2)},
+        "server_address": SERVER_ADDRESS,
+        "comfy_reachable": check_comfyui(),
+        "models": {
+            "diffusion_models": os.listdir(os.path.join(COMFY_ROOT,"models","diffusion_models")) if os.path.isdir(os.path.join(COMFY_ROOT,"models","diffusion_models")) else [],
+            "loras": os.listdir(os.path.join(COMFY_ROOT,"models","loras")) if os.path.isdir(os.path.join(COMFY_ROOT,"models","loras")) else [],
+        }
+    }
+# ---------- end helpers ----------
+SERVER_ADDRESS", "127.0.0.1")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Version stamp to prove the new handler is actually deployed
@@ -247,6 +358,17 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # This is where your old handler was dying with JSONDecodeError.
         # Now it will give a clear error if missing/empty/invalid.
         prompt = load_workflow(workflow_file)
+        # Optional: override LoRA file names (must exist in /ComfyUI/models/loras)
+        lora_name = (input_data.get("lora_name") or "").strip()
+        if lora_name:
+            # Allow passing without extension
+            if not any(lora_name.lower().endswith(ext) for ext in [".safetensors", ".pt", ".ckpt"]):
+                lora_name += ".safetensors"
+            # Update known Wan LoRA selector nodes if present
+            for nid in ("279","553"):
+                if nid in prompt and "inputs" in prompt[nid] and "lora_0" in prompt[nid]["inputs"]:
+                    prompt[nid]["inputs"]["lora_0"] = lora_name
+
 
         # =========================
         # PARAMS
@@ -272,7 +394,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # =========================
         # IMPORTANT: These IDs must match your exported ComfyUI workflow JSON.
         # If any are wrong, you'll see it in ComfyUI history output.
-        prompt["244"]["inputs"]["image"] = image_path
+        prompt["244"]["inputs"]["image"] = os.path.basename(image_path)
         prompt["541"]["inputs"]["num_frames"] = length
 
         prompt["135"]["inputs"]["positive_prompt"] = positive
